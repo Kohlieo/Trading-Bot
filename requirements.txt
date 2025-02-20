@@ -11,3 +11,4 @@ gymnasium==1.0.0
 gym==0.26.2
 beautifulsoup4
 progressbar
+shimmy==0.2.1

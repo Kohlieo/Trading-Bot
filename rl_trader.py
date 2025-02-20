@@ -22,10 +22,10 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from ib_insync import Stock
-from stable_baselines3 import PPO
+from stable_baselines3 import SAC  # <-- Changed from PPO to SAC
 from config import RL_MODEL_PATH, RL_SYMBOLS, MAX_SYMBOLS, MARKET_DATA_TYPE
 from ibkr_connection import ibkr_client
-from order_management import place_order
+from order_management import place_order, close_all_positions
 
 # Import TradingEnv and load_clean_data from the Data Farm module
 from trading_env import TradingEnv, load_clean_data
@@ -53,8 +53,18 @@ class RLTrader:
         # Truncate if length > MAX_SYMBOLS
         self.symbols = self.symbols[:MAX_SYMBOLS]
 
-        # Load your pre-trained RL model
-        self.model = PPO.load(RL_MODEL_PATH)
+        # Create a temporary environment instance
+        env = TradingEnv(load_clean_data())
+
+        # Load your pre-trained RL model using SAC (instead of PPO)
+        self.model = SAC.load(
+            RL_MODEL_PATH,
+            env=env,
+            custom_objects={
+                "observation_space": env.observation_space,
+                "action_space": env.action_space,
+            }
+        )
 
         # IMPORTANT: Correctly set the market data type (1=live, 3=delayed, etc.)
         ibkr_client.ib.reqMarketDataType(MARKET_DATA_TYPE)
@@ -187,6 +197,9 @@ class RLTrader:
         return tick_buffer
 
     async def run(self):
+        # Initialize the last ticker refresh time
+        self.last_ticker_refresh = datetime.utcnow()
+
         # Pre-populate tick buffers using historical ticks for each symbol
         for sym in self.symbols:
             try:
@@ -205,12 +218,67 @@ class RLTrader:
             ibkr_client.ib.waitOnUpdate(timeout=1)
             current_utc = datetime.utcnow()
             current_pst = current_utc - timedelta(hours=8)
+            
+            # Check if it's a new trading day and reset counters if so
             if self.current_trade_date != current_pst.date():
                 self.current_trade_date = current_pst.date()
                 for sym in self.symbols:
                     self.trades_count[sym] = 0
                     self.trade_cycle_active[sym] = False
                 logging.info(f"New trading day (PST): {self.current_trade_date}. Reset trade counters.")
+
+            # === Periodically refresh ticker list every 3 minutes ===
+            if (current_utc - self.last_ticker_refresh).total_seconds() >= 180:
+                self.last_ticker_refresh = current_utc
+                ticker_file = "/app/shared/rl_trader_tickers.json"
+                try:
+                    if os.path.exists(ticker_file):
+                        with open(ticker_file, 'r') as f:
+                            new_tickers = json.load(f)
+                        if not new_tickers or len(new_tickers) < 1:
+                            logging.warning("Ticker file is empty or invalid; using current symbols.")
+                            new_tickers = self.symbols
+                    else:
+                        logging.warning(f"{ticker_file} not found; retaining current symbols.")
+                        new_tickers = self.symbols
+                except Exception as e:
+                    logging.error("Error reloading tickers from file: " + str(e))
+                    new_tickers = self.symbols
+
+                # Determine symbols to remove (present in current list but not in new_tickers)
+                removed_symbols = [sym for sym in self.symbols if sym not in new_tickers]
+                for sym in removed_symbols:
+                    logging.info(f"Symbol {sym} no longer in ticker list. Exiting any open position.")
+                    try:
+                        tick_size = await ibkr_client.get_tick_size(sym)
+                    except Exception as e:
+                        logging.error(f"Could not get tick size for {sym}: {e}")
+                        tick_size = 0.01  # Fallback tick size
+                    # Use latest available price from price buffer if available
+                    if self.price_buffers.get(sym) and len(self.price_buffers[sym]) > 0:
+                        latest_price = self.price_buffers[sym][-1]['price']
+                    else:
+                        latest_price = None
+                    if latest_price is not None:
+                        asyncio.create_task(close_all_positions(sym, tick_size, latest_price))
+                    # Remove symbol from internal dictionaries
+                    self.price_buffers.pop(sym, None)
+                    self.trade_cycle_active.pop(sym, None)
+                    self.trades_count.pop(sym, None)
+                
+                # Update internal symbols and add new symbols if needed
+                for sym in new_tickers:
+                    if sym not in self.price_buffers:
+                        self.price_buffers[sym] = []
+                    if sym not in self.trade_cycle_active:
+                        self.trade_cycle_active[sym] = False
+                    if sym not in self.trades_count:
+                        self.trades_count[sym] = 0
+                self.symbols = new_tickers
+                logging.info(f"Updated ticker list: {self.symbols}")
+            # === End of ticker refresh logic ===
+
+            # Trading logic for each symbol
             for symbol in self.symbols:
                 if current_pst.hour < 1 or current_pst.hour >= 15:
                     logging.info(f"[RLTrader] {symbol}: Outside allowed trading window (PST {current_pst.hour}). Skipping trade.")
@@ -242,12 +310,9 @@ class RLTrader:
                     else:
                         logging.info(f"[RLTrader] {symbol}: No active trade to sell. Skipping SELL.")
                 last_action[symbol] = action
-            if current_utc.time() >= datetime.strptime("19:00", "%H:%M").time() and not self.trained_today:
-                await self.online_train()
-                self.trained_today = True
-            elif current_utc.time() < datetime.strptime("19:00", "%H:%M").time():
-                self.trained_today = False
+
             await asyncio.sleep(1)
+
 
     async def online_train(self):
         """
@@ -277,3 +342,4 @@ class RLTrader:
 if __name__ == "__main__":
     trader = RLTrader()
     asyncio.run(trader.run())
+

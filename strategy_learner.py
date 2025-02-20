@@ -5,9 +5,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import optuna
 
-# For RL training with Stable Baselines 3
-from stable_baselines3 import PPO
+# For RL training with Stable Baselines 3 using SAC
+from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 
 from trading_env import TradingEnv, load_clean_data
 from config import (
@@ -36,13 +37,30 @@ from config import (
     TUNING_N_EPISODES_EVALUATION
 )
 
+# -----------------------------
+# Custom Logging Callback
+# -----------------------------
+class LoggingCallback(BaseCallback):
+    """
+    A custom callback that logs training progress every 1000 steps.
+    """
+    def __init__(self, verbose=1):
+        super().__init__(verbose)
+    
+    def _on_step(self) -> bool:
+        if self.n_calls % 1000 == 0:
+            # 'reward' might not always be available, so we use locals().get for safety.
+            latest_reward = self.locals.get('reward', 'N/A')
+            print(f"Step: {self.n_calls}, Latest reward: {latest_reward}")
+        return True
+
 # ---------------------------------------------
 # RL Training & Evaluation Functions
 # ---------------------------------------------
-
 def train_rl_agent(env, total_timesteps):
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-    model.learn(total_timesteps=total_timesteps)
+    model = SAC("MlpPolicy", env, verbose=1, device="cpu")
+    # Add the logging callback to monitor training progress.
+    model.learn(total_timesteps=total_timesteps, callback=LoggingCallback())
     return model
 
 def evaluate_rl_agent(model, env, n_episodes=N_EPISODES_EVALUATION, accuracy_weight=0.1, trade_count_weight=10):
@@ -182,9 +200,8 @@ def objective(trial):
         hold_reward_scaling=hold_reward_scaling
     )
 
-    model = PPO("MlpPolicy", env, verbose=0, device="cpu")
-    model.learn(total_timesteps=TUNING_TOTAL_TIMESTEPS)
-
+    model = SAC("MlpPolicy", env, verbose=0, device="cpu")
+    model.learn(total_timesteps=TUNING_TOTAL_TIMESTEPS, callback=LoggingCallback())
     avg_reward = evaluate_rl_agent(
         model, env, n_episodes=TUNING_N_EPISODES_EVALUATION,
         accuracy_weight=accuracy_weight,
@@ -196,7 +213,7 @@ if __name__ == "__main__":
     df = load_clean_data(CSV_PATH)
     num_envs = 4
     envs = SubprocVecEnv([make_env() for _ in range(num_envs)])
-    model = PPO("MlpPolicy", envs, verbose=1, device="cpu")
+    model = SAC("MlpPolicy", envs, verbose=1, device="cpu")
     model = train_rl_agent(envs, total_timesteps=TOTAL_TIMESTEPS)
     model.save(os.path.join(os.getcwd(), "latest_trading_bot_model"))
 

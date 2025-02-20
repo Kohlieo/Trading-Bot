@@ -1,20 +1,13 @@
-
 # trading_env.py
 # --------------
-# This module implements a custom OpenAI Gym environment (TradingEnv) designed for simulating trading activities. Its features include:
-#   - Loading and preprocessing historical market data from a CSV file
-#   - Computing technical indicators (SMA, RSI, MACD, Bollinger Bands, ATR, etc.) using pandas_ta
-#   - Defining an observation space (14 features) and a discrete action space (0=Hold, 1=Buy, 2=Sell)
-#   - Simulating the trading process with step and reset functions, including reward calculations that factor in transaction costs and trade penalties
-#   - Providing a simulation framework for offline RL model training and strategy backtesting
-# This environment is key for testing and refining trading strategies in a controlled, simulated setting.
+# This module implements a custom OpenAI Gym environment (TradingEnv) for simulating trading activities.
 
 import os
 import gym
 from gym import spaces
 import numpy as np
 import pandas as pd
-import pandas_ta as ta  # Import pandas_ta for technical indicators
+import pandas_ta as ta  # For technical indicators
 
 from config import (
     CSV_PATH,
@@ -79,9 +72,7 @@ class TradingEnv(gym.Env):
         self.hold_reward_scaling = hold_reward_scaling
         self.current_step = 0
         
-        # Ensure 'DateTime' is datetime (already done during data loading)
-
-        # Add required columns if not present
+        # Ensure required price columns exist
         if 'Open' not in self.df.columns:
             self.df['Open'] = self.df['Close']
         if 'High' not in self.df.columns:
@@ -89,32 +80,24 @@ class TradingEnv(gym.Env):
         if 'Low' not in self.df.columns:
             self.df['Low'] = self.df['Close']
         if 'Volume' not in self.df.columns:
-            self.df['Volume'] = 1000  # Use dummy volume data if not available
+            self.df['Volume'] = 1000
 
-        # Calculate indicators using pandas_ta
+        # Calculate technical indicators using pandas_ta
         self.df.ta.sma(length=14, append=True)
         self.df.ta.rsi(length=14, append=True)
         self.df.ta.macd(append=True)
         self.df.ta.bbands(length=20, std=2, append=True)
         self.df.ta.atr(length=14, append=True)
 
-        # Check and adjust column names
-        # Print the columns to check the actual names
-        # print(self.df.columns)
-
-        # Adjust 'ATRr_14' to 'ATR_14' if necessary
         if 'ATRr_14' in self.df.columns:
             self.df.rename(columns={'ATRr_14': 'ATR_14'}, inplace=True)
 
         # Custom indicators
         self.df['Returns'] = self.df['Close'].pct_change()
-        self.df['Volatility'] = (
-            self.df['Returns'].rolling(window=14).std() * np.sqrt(14)
-        )
+        self.df['Volatility'] = self.df['Returns'].rolling(window=14).std() * np.sqrt(14)
         self.df['AvgVolume'] = self.df['Volume'].rolling(window=14).mean()
         self.df['RelativeVolume'] = self.df['Volume'] / self.df['AvgVolume']
 
-        # Handle missing values
         self.df.fillna(0, inplace=True)
 
         # Define features for observations (14 features)
@@ -127,13 +110,14 @@ class TradingEnv(gym.Env):
         if missing_cols:
             raise ValueError(f"Missing columns in data after calculations: {missing_cols}")
 
+        # Change action space to continuous for SAC:
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
             shape=(len(self.feature_columns),),
             dtype=np.float32
         )
-        self.action_space = spaces.Discrete(3)  # 0=Hold, 1=Buy, 2=Sell
 
         # Internal state
         self.position = 0    # 0: flat, 1: long
@@ -180,9 +164,7 @@ class TradingEnv(gym.Env):
                 return 0.0
 
     def reset(self):
-        self.current_step = np.random.randint(
-            0, max(1, self.n_steps - self.min_episode_length)
-        )
+        self.current_step = np.random.randint(0, max(1, self.n_steps - self.min_episode_length))
         self.position = 0
         self.entry_price = 0.0
         self.total_profit = 0.0
@@ -199,11 +181,23 @@ class TradingEnv(gym.Env):
         return self._next_observation()
 
     def step(self, action):
+        # --- Convert continuous action to discrete ---
+        # For SAC, action is a continuous value in [-1, 1]
+        if isinstance(action, (np.ndarray, list)):
+            action_val = action[0]
+        else:
+            action_val = action
+        # Define thresholds to map continuous action to discrete decisions:
+        if action_val > 0.33:
+            action = 1   # Buy
+        elif action_val < -0.33:
+            action = 2   # Sell
+        else:
+            action = 0   # Hold
+        # ---------------------------------------------
+
         current_price = self.df.loc[self.current_step, 'Close']
-        prev_price = (
-            self.df.loc[self.current_step - 1, 'Close'] 
-            if self.current_step > 0 else current_price
-        )
+        prev_price = self.df.loc[self.current_step - 1, 'Close'] if self.current_step > 0 else current_price
 
         step_date = self.df.loc[self.current_step, 'DateTime'].date()
         if self.current_date is None or step_date != self.current_date:
