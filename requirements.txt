@@ -1,0 +1,13 @@
+quart
+ib-insync
+requests
+werkzeug
+pandas
+torch>=1.9
+numpy== 1.23.5
+stable-baselines3==2.5.0
+sb3-contrib==2.5.0
+gymnasium==1.0.0
+gym==0.26.2
+beautifulsoup4
+progressbar

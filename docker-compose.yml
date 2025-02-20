@@ -1,0 +1,32 @@
+version: '3'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ibkr_bot
+    environment:
+      - PYTHONUNBUFFERED=1
+      - IB_HOST=host.docker.internal
+      - IB_PORT=7496
+      - IB_CLIENT_ID=123
+      - LOG_LEVEL=INFO
+    volumes:
+      - .:/app
+      - C:/SharedData:/app/shared
+    ports:
+      - "5000:5000"
+
+  ngrok:
+    build:
+      context: ./ngrok
+    container_name: ngrok
+    depends_on:
+      - bot
+    ports:
+      - "4040:4040"  # Exposes ngrok web interface on port 4040
+    command: ngrok http --domain=hound-finer-mite.ngrok-free.app bot:5000
+
+volumes:
+  shared-data:

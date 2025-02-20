@@ -1,0 +1,15 @@
+BUY
+
+curl -X POST https://hound-finer-mite.ngrok-free.app/webhook -H "Content-Type: application/json" -d "{\"symbol\":\"AAPL\", \"action\":\"BUY\", \"price\": 15.00}"
+
+SELL
+
+curl -X POST https://hound-finer-mite.ngrok-free.app/webhook -H "Content-Type: application/json" -d "{\"symbol\":\"AAPL\", \"action\":\"SELL\", \"price\": 15.00}"
+
+
+
+Crypto bot
+
+curl -X POST http://127.0.0.1:5000/webhook -H "Content-Type: application/json" -d '{"ticker":"BTCUSD","action":"buy","quantity":"0.01"}'
+
+curl -X POST https://hound-finer-mite.ngrok-free.app/webhook -H "Content-Type: application/json" -d '{"ticker":"BTCUSD","action":"buy","quantity":"0.01"}'

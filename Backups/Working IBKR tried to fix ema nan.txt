@@ -1,0 +1,632 @@
+import asyncio
+import logging
+import os
+import signal
+import sys
+import threading
+import pandas as pd
+import ib_insync
+import time
+import math
+from quart import Quart, request, jsonify
+from ib_insync import IB, Stock, LimitOrder
+
+# Initialize logging with exception tracebacks
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Patch the asyncio event loop
+ib_insync.util.patchAsyncio()
+
+# Quart setup
+app = Quart(__name__)
+
+# IBKR connection instance
+ib = IB()
+
+# Variables to store shared state
+available_equity = None
+state_lock = threading.Lock()
+ema_storage = {}  # Store EMA values per symbol
+
+# Tick size cache file path for persistence
+TICK_SIZE_FILE = 'tick_sizes.txt'
+
+# Trailing stop parameters
+take_profit_percentage = 0.05  # 5% gain (if needed in future)
+initial_stop_loss_percentage = 0.02  # 2% initial stop loss
+trailing_stop_loss_percentage = 0.03  # 3% trailing stop
+stop_loss_fixed_trigger = 0.02  # 1% above entry price where stop loss becomes fixed
+pre_market_buffer = 0.005  # 0.5% buffer for pre-market volatility
+
+class SymbolMonitor:
+    def __init__(self, symbol, total_quantity, entry_price, tick_size, starting_ema_values):
+        self.symbol = symbol
+        self.total_quantity = total_quantity
+        self.entry_price = entry_price
+        self.tick_size = tick_size
+        self.starting_ema_values = starting_ema_values
+        self.contract = Stock(symbol, "SMART", "USD")
+        self.ticker = None
+        self.highest_price = entry_price
+        self.stop_loss_price = round_to_tick(entry_price * (1 - initial_stop_loss_percentage), tick_size)
+        self.trailing = True
+        self.prices = []
+        self.quantities = {
+            'first_sell': total_quantity // 2,
+            'second_sell': total_quantity - (total_quantity // 2)
+        }
+        self.first_sell_done = False
+        self.second_sell_done = False
+        self.ema3, self.ema9, self.ema12 = starting_ema_values if starting_ema_values else (None, None, None)
+
+def load_tick_sizes():
+    """
+    Load tick sizes from the persistent text file.
+    """
+    tick_sizes = {}
+    if os.path.exists(TICK_SIZE_FILE):
+        with open(TICK_SIZE_FILE, 'r') as f:
+            for line in f:
+                symbol, tick_size = line.strip().split(',')
+                tick_sizes[symbol] = float(tick_size)
+    return tick_sizes
+
+def save_tick_sizes(tick_sizes):
+    """
+    Save tick sizes to the persistent text file.
+    """
+    with open(TICK_SIZE_FILE, 'w') as f:
+        for symbol, tick_size in tick_sizes.items():
+            f.write(f"{symbol},{tick_size}\n")
+
+# Load initial tick sizes into the cache
+tick_size_cache = load_tick_sizes()
+
+def round_to_tick(value, tick_size):
+    """
+    Round the given value to the nearest tick size.
+
+    Args:
+        value (float): The value to round.
+        tick_size (float): The tick size to round to.
+
+    Returns:
+        float: The value rounded to the nearest tick size.
+    """
+    return round(value / tick_size) * tick_size
+
+async def connect_ibkr():
+    """
+    Async function to connect to IBKR.
+    """
+    try:
+        if not ib.isConnected():
+            logging.info("Attempting to connect to IBKR...")
+            host = "host.docker.internal"  # Adjust as needed
+            port = 7496  # Use port 7496 for paper trading
+            client_id = 123
+            logging.info(f"Connecting to {host}:{port} with client ID {client_id}")
+            await ib.connectAsync(host, port, clientId=client_id, timeout=15)
+            logging.info("Successfully connected to IBKR.")
+    except Exception as e:
+        logging.error(f"Failed to connect to IBKR at {host}:{port}: {e}", exc_info=True)
+        # Implement retry logic or exit gracefully as needed
+
+async def ensure_connection():
+    """
+    Ensure connection to IBKR. Reconnect if disconnected.
+    """
+    if not ib.isConnected():
+        logging.warning("IBKR disconnected. Reconnecting...")
+        await connect_ibkr()
+
+async def get_tick_size(symbol):
+    """
+    Fetch the tick size for the given symbol from IBKR or cache.
+
+    Args:
+        symbol (str): The ticker symbol.
+
+    Returns:
+        float: The tick size for the symbol.
+    """
+    if symbol in tick_size_cache:
+        return tick_size_cache[symbol]
+    try:
+        await ensure_connection()
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+        ib.reqMarketDataType(1)  # 1 - Live, includes pre-market data
+
+        # Request tick size and other market data
+        ticker = ib.reqMktData(contract, '', False, False)
+
+        # Wait for the data to arrive
+        while not ticker.priceIncrement:
+            await asyncio.sleep(0.1)
+
+        tick_size = ticker.priceIncrement
+        logging.info(f"Fetched tick size for {symbol}: {tick_size}")
+
+        # Cache the tick size and save to file
+        tick_size_cache[symbol] = tick_size
+        save_tick_sizes(tick_size_cache)
+
+        return tick_size
+    except Exception as e:
+        logging.error(f"Error fetching tick size for {symbol}: {e}", exc_info=True)
+        return 0.01  # Default to a common tick size if unable to fetch
+
+async def cancel_active_orders(symbol):
+    """
+    Cancel active orders for the given symbol.
+
+    Args:
+        symbol (str): The ticker symbol.
+    """
+    try:
+        await ensure_connection()
+        # Fetch all open orders
+        for trade in ib.trades():
+            order = trade.order
+            if trade.contract.symbol == symbol and not trade.isDone():
+                ib.cancelOrder(order)
+                # Wait for order cancellation
+                while order.orderStatus.status not in ('Cancelled', 'Filled'):
+                    await asyncio.sleep(0.1)
+                logging.info(f"Cancelled order {order.orderId} for {symbol}.")
+    except Exception as e:
+        logging.error(f"Error cancelling orders for {symbol}: {e}", exc_info=True)
+
+async def place_order(
+    symbol: str,
+    action: str,
+    price: float = None,
+    starting_ema_values: tuple = None) -> dict:
+    """
+    Place an order via IBKR, ensuring proper order handling.
+
+    Args:
+        symbol (str): The ticker symbol.
+        action (str): 'BUY' or 'SELL'.
+        price (float, optional): The price at which to execute.
+        starting_ema_values (tuple, optional): Starting EMA values (ema3, ema9, ema12).
+
+    Returns:
+        dict: Result of the operation.
+    """
+    try:
+        await ensure_connection()
+
+        # Fetch the tick size
+        tick_size = await get_tick_size(symbol)
+        logging.info(f"Tick size for {symbol}: {tick_size}")
+
+        # Set market data type to receive live data suitable for pre-market
+        ib.reqMarketDataType(1)
+
+        # Adjust the price for pre-market conditions
+        buffer = pre_market_buffer  # 0.5% buffer for pre-market volatility
+
+        if action.upper() == "SELL":
+            # Cancel any existing orders before placing the new sell order
+            await cancel_active_orders(symbol)
+
+            # Forcefully close all positions for the symbol
+            result = await close_all_positions(symbol, tick_size, price)
+
+            # Update available equity after closing positions
+            await get_account_balance()
+
+            logging.info(f"All positions for {symbol} have been closed.")
+            return {"status": f"All positions for {symbol} closed successfully.", "details": result}
+
+        elif action.upper() == "BUY":
+            if available_equity is None:
+                logging.error("Available equity not fetched yet.")
+                return {"error": "Available equity not available"}
+
+            if price is None:
+                # Fetch the latest price if not provided
+                contract = Stock(symbol, "SMART", "USD")
+                ticker = ib.reqMktData(contract, '', False, False)
+
+                # Wait for the data to arrive
+                while not ticker.last:
+                    await asyncio.sleep(0.1)
+                price = ticker.last
+                logging.info(f"Fetched latest price for {symbol}: {price}")
+
+            # Use a percentage to adjust the price dynamically for pre-market conditions
+            adjusted_price = round_to_tick(price * (1 + buffer), tick_size)  # Adds buffer
+
+            async with state_lock:
+                # Calculate quantity based on available equity
+                quantity = int((available_equity * 0.65) // adjusted_price)
+
+            contract = Stock(symbol, "SMART", "USD")
+
+            # Create main order with appropriate TIF for pre-market
+            main_order = LimitOrder(
+                "BUY",
+                quantity,
+                adjusted_price,
+                outsideRth=True,
+                tif='DAY'
+            )
+
+            # Place the main order
+            trade = ib.placeOrder(contract, main_order)
+
+            # Update available equity after placing BUY order
+            await get_account_balance()
+
+            logging.info(
+                f"Order placed: BUY {quantity} {symbol} at ${adjusted_price:.2f} "
+                f"(outside RTH enabled, TIF=DAY)"
+            )
+
+            # Create an instance of SymbolMonitor
+            symbol_monitor = SymbolMonitor(
+                symbol=symbol,
+                total_quantity=quantity,
+                entry_price=adjusted_price,
+                tick_size=tick_size,
+                starting_ema_values=starting_ema_values
+            )
+
+            # Monitor and manage the order actively, pass the trade object
+            asyncio.create_task(symbol_monitor.monitor_order(trade))
+
+            return {"status": "Order placed successfully", "order_id": trade.order.orderId}
+
+        else:
+            # If action is neither BUY nor SELL
+            logging.error(f"Invalid action: {action}")
+            return {"error": "Invalid action specified"}
+
+    except Exception as e:
+        logging.error(f"Error placing order: {e}", exc_info=True)
+        return {"error": "Failed to place order", "details": str(e)}
+
+async def close_all_positions(symbol, tick_size, price):
+    """
+    Close all open positions for the given symbol.
+
+    Args:
+        symbol (str): The ticker symbol.
+        tick_size (float): The tick size for the symbol.
+        price (float): The current price of the symbol.
+
+    Returns:
+        dict: Result of the operation.
+    """
+    try:
+        await ensure_connection()
+        # Define buffer for pre-market conditions
+        buffer = pre_market_buffer  # 0.5% buffer for pre-market volatility
+
+        # Cancel any existing orders before placing the new sell order
+        await cancel_active_orders(symbol)
+
+        positions = ib.positions()
+        for position in positions:
+            if position.contract.symbol == symbol and position.position > 0:
+                # Adjust price to ensure the order goes through
+                limit_price = round_to_tick(price * (1 - buffer), tick_size)  # Slightly below market price
+
+                contract = Stock(symbol, "SMART", "USD")
+                sell_order = LimitOrder("SELL", position.position, limit_price, outsideRth=True, tif='DAY')
+                trade = ib.placeOrder(contract, sell_order)
+                logging.info(f"Close order placed for {symbol}: {trade.order.orderId}.")
+
+                # Monitor the sell order
+                # Create a simple monitor task or adjust as needed
+                asyncio.create_task(monitor_simple_sell_order(trade, symbol))
+
+        logging.info(f"All positions for {symbol} have been closed.")
+        return {"status": "Success", "message": f"Positions for {symbol} closed."}
+    except Exception as e:
+        logging.error(f"Error closing positions for {symbol}: {e}", exc_info=True)
+        return {"status": "Error", "message": str(e)}
+
+async def monitor_order(self, trade):
+        """
+        Monitor the given order and log status updates.
+        """
+        try:
+            while not trade.isDone():
+                await asyncio.sleep(1)
+            logging.info(f"[{self.symbol}] Order {trade.order.orderId} completed with status {trade.orderStatus.status}")
+            if trade.orderStatus.status == 'Filled' and trade.order.action == 'BUY':
+                # Start monitoring price for trailing stop-loss
+                await self.monitor_price()
+        except Exception as e:
+            logging.error(f"[{self.symbol}] Error monitoring order {trade.order.orderId}: {e}", exc_info=True)
+
+
+async def monitor_price(self):
+        """
+        Monitor the price for trailing stop-loss implementation and EMA-based take profit.
+        """
+        try:
+            await ensure_connection()
+            ib.reqMarketDataType(1)  # Ensure live data
+
+            # Unique ticker for this symbol
+            self.ticker = ib.reqMktData(self.contract, '', False, False)
+
+            logging.info(f"[{self.symbol}] Monitoring - Entry Price: ${self.entry_price:.2f}, Initial Stop-Loss: ${self.stop_loss_price:.2f}")
+            logging.info(f"[{self.symbol}] Starting EMAs - EMA3: {self.ema3}, EMA9: {self.ema9}, EMA12: {self.ema12}")
+
+            while True:
+                await asyncio.sleep(1)
+
+                current_price = None
+                if self.ticker.last is not None and not math.isnan(self.ticker.last):
+                    current_price = self.ticker.last
+                elif self.ticker.close is not None and not math.isnan(self.ticker.close):
+                    current_price = self.ticker.close
+
+                if current_price is None:
+                    logging.warning(f"[{self.symbol}] Current price is not available. Skipping this iteration.")
+                    continue  # Wait for valid price data
+
+                current_price = float(current_price)
+
+                # Append current price to the prices list
+                self.prices.append(current_price)
+                if len(self.prices) > 50:
+                    self.prices.pop(0)
+
+                # Calculate EMAs
+                if self.ema3 is None:
+                    self.ema3 = current_price
+                else:
+                    self.ema3 = (current_price - self.ema3) * (2 / (3 + 1)) + self.ema3  # EMA with period 3
+
+                if self.ema9 is None:
+                    self.ema9 = current_price
+                else:
+                    self.ema9 = (current_price - self.ema9) * (2 / (9 + 1)) + self.ema9  # EMA with period 9
+
+                if self.ema12 is None:
+                    self.ema12 = current_price
+                else:
+                    self.ema12 = (current_price - self.ema12) * (2 / (12 + 1)) + self.ema12  # EMA with period 12
+
+                logging.info(f"[{self.symbol}] Current Price: ${current_price:.4f}")
+                logging.info(f"[{self.symbol}] EMA3: ${self.ema3:.4f}, EMA9: ${self.ema9:.4f}, EMA12: ${self.ema12:.4f}")
+
+                # Sell 50% when EMA3 crosses below EMA9
+                if not self.first_sell_done and self.ema3 < self.ema9:
+                    logging.info(f"[{self.symbol}] EMA3 has crossed below EMA9. Selling 50% of the position.")
+                    await self.place_sell_order(self.quantities['first_sell'], current_price)
+                    self.first_sell_done = True
+
+                # Sell remaining 50% when EMA3 crosses below EMA12
+                if self.first_sell_done and not self.second_sell_done and self.ema3 < self.ema12:
+                    logging.info(f"[{self.symbol}] EMA3 has crossed below EMA12. Selling remaining position.")
+                    await self.place_sell_order(self.quantities['second_sell'], current_price)
+                    self.second_sell_done = True
+
+                # Trailing stop-loss logic
+                if self.trailing:
+                    if current_price > self.highest_price:
+                        self.highest_price = current_price
+                        # Update stop-loss to trail below the highest price
+                        self.stop_loss_price = round_to_tick(self.highest_price * (1 - trailing_stop_loss_percentage), self.tick_size)
+                        logging.info(f"[{self.symbol}] New high: ${self.highest_price:.2f}, Trailing Stop-Loss updated to ${self.stop_loss_price:.2f}")
+                        print(f"Trailing Stop-Loss for {self.symbol} updated to: ${self.stop_loss_price:.2f}")
+
+                    # Check if price has reached trigger point to fix stop-loss
+                    if current_price >= self.entry_price * (1 + stop_loss_fixed_trigger):
+                        self.trailing = False  # Stop trailing
+                        # Fix the stop-loss price at current level
+                        self.stop_loss_price = round_to_tick(current_price * (1 - trailing_stop_loss_percentage), self.tick_size)
+                        logging.info(f"[{self.symbol}] Price target reached. Stop-loss fixed at ${self.stop_loss_price:.2f}")
+                        print(f"Stop-Loss for {self.symbol} fixed at: ${self.stop_loss_price:.2f}")
+
+                # Check for stop-loss condition
+                if current_price <= self.stop_loss_price:
+                    logging.info(f"[{self.symbol}] Current price has reached the stop-loss price of ${self.stop_loss_price:.2f}. Initiating sell order.")
+                    # Sell any remaining quantities that haven't been sold yet
+                    remaining_quantity = self.total_quantity
+                    if self.first_sell_done:
+                        remaining_quantity -= self.quantities['first_sell']
+                    if self.second_sell_done:
+                        remaining_quantity -= self.quantities['second_sell']
+
+                    if remaining_quantity > 0:
+                        await self.place_sell_order(remaining_quantity, current_price)
+                    break  # Exit the loop
+
+                # Exit loop if all quantities have been sold
+                if self.first_sell_done and self.second_sell_done:
+                    logging.info(f"[{self.symbol}] All positions have been sold based on EMA crossovers.")
+                    break
+
+            logging.info(f"[{self.symbol}] Monitoring completed.")
+
+        except Exception as e:
+            logging.error(f"[{self.symbol}] Error monitoring price: {e}", exc_info=True)
+
+async def place_sell_order(self, quantity, current_price):
+        """
+        Place a sell order for the given quantity at the current price.
+        """
+        try:
+            await ensure_connection()
+
+            if quantity <= 0:
+                logging.warning(f"[{self.symbol}] No quantity left to sell.")
+                return
+
+            ib.reqMarketDataType(1)  # Ensure live data
+
+            # Adjust price slightly with buffer for better execution
+            buffer = pre_market_buffer
+            limit_price = round_to_tick(current_price * (1 - buffer), self.tick_size)
+            sell_order = LimitOrder("SELL", quantity, limit_price, outsideRth=True, tif='DAY')
+            sell_trade = ib.placeOrder(self.contract, sell_order)
+
+            # Update available equity after placing SELL order
+            await get_account_balance()
+
+            logging.info(f"[{self.symbol}] Placed SELL order for {quantity} at ${limit_price:.2f}")
+
+            # Monitor the sell order
+            asyncio.create_task(self.monitor_sell_order(sell_trade))
+
+        except Exception as e:
+            logging.error(f"[{self.symbol}] Error placing sell order: {e}", exc_info=True)
+
+async def monitor_simple_sell_order(trade, symbol):
+    """
+    Monitor the sell order until it is completed.
+    """
+    try:
+        while not trade.isDone():
+            await asyncio.sleep(1)
+        logging.info(f"[{symbol}] Sell order {trade.order.orderId} completed with status {trade.orderStatus.status}")
+    except Exception as e:
+        logging.error(f"[{symbol}] Error monitoring sell order {trade.order.orderId}: {e}", exc_info=True)
+
+async def monitor_sell_order(self, trade):
+        """
+        Monitor the sell order until it is completed.
+        """
+        try:
+            while not trade.isDone():
+                await asyncio.sleep(1)
+            logging.info(f"[{self.symbol}] Sell order {trade.order.orderId} completed with status {trade.orderStatus.status}")
+        except Exception as e:
+            logging.error(f"[{self.symbol}] Error monitoring sell order {trade.order.orderId}: {e}", exc_info=True)
+
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    """
+    Handle incoming webhook requests to place orders.
+    """
+    data = await request.get_json()
+    logging.debug(f"Received data: {data}")
+
+    symbol = data.get('symbol')
+    action = data.get('action')
+    price = data.get('price')
+
+    # Log the values for debugging
+    logging.debug(f"Symbol: {symbol}, Action: {action}, Price: {price}")
+
+    starting_ema3 = data.get('ema3')
+    starting_ema9 = data.get('ema9')
+    starting_ema12 = data.get('ema12')
+
+    if not symbol or not action or price is None:
+        logging.error("Invalid input data")
+        return jsonify({"error": "Invalid input"}), 400
+
+    valid_actions = {'BUY', 'SELL'}
+    if action.upper() not in valid_actions:
+        logging.error("Invalid action specified")
+        return jsonify({"error": "Invalid action"}), 400
+
+    try:
+        price = float(price)
+        starting_ema3 = float(starting_ema3) if starting_ema3 else None
+        starting_ema9 = float(starting_ema9) if starting_ema9 else None
+        starting_ema12 = float(starting_ema12) if starting_ema12 else None
+    except ValueError:
+        logging.error("Invalid numerical value in input")
+        return jsonify({"error": "Invalid numerical value in input"}), 400
+
+    # Store EMA values per symbol as a tuple
+    ema_storage[symbol] = (
+        starting_ema3,
+        starting_ema9,
+        starting_ema12,
+    )
+
+    # Ensure `place_order` runs without blocking
+    loop = asyncio.get_running_loop()
+    loop.create_task(
+        place_order(
+            symbol,
+            action,
+            price,
+            starting_ema_values=ema_storage[symbol]
+        )
+    )
+
+    return jsonify({"message": "Order request is being processed."}), 202
+
+async def get_account_balance():
+    """
+    Fetches and sets the available equity.
+    """
+    global available_equity
+    try:
+        await ensure_connection()
+        if not ib.isConnected():
+            logging.error("Cannot get account balance because IBKR is not connected.")
+            return
+
+        account_summary = await ib.accountSummaryAsync()
+        
+        for account_value in account_summary:
+            if account_value.tag == 'AvailableFunds':
+                with state_lock:  # Ensure thread safety
+                    available_equity = float(account_value.value)
+                    logging.info(f"Available Equity: {available_equity}")
+                break
+    except Exception as e:
+        logging.error(f"Error getting account balance: {e}", exc_info=True)
+
+async def sync_positions_with_ibkr():
+    """
+    Log current IBKR positions at startup.
+    """
+    try:
+        await ensure_connection()
+        positions = await asyncio.to_thread(ib.positions)  # Run in a separate thread
+        
+        for position in positions:
+            symbol = position.contract.symbol
+            logging.info(f"Position: {symbol}, Quantity: {position.position}, Avg Cost: {position.avgCost}")
+    except Exception as e:
+        logging.error(f"Error syncing positions with IBKR: {e}", exc_info=True)
+
+def signal_handler(sig, frame):
+    """
+    Handle shutdown signals to gracefully disconnect from IBKR.
+    """
+    logging.info("Shutting down...")
+    if ib.isConnected():
+        ib.disconnect()
+    sys.exit(0)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+async def main():
+    """
+    Main function to start the application.
+    """
+    await connect_ibkr()
+    await get_account_balance()
+    await sync_positions_with_ibkr()
+
+    # Removed the periodic update task
+
+    # Run the Quart app
+    await app.run_task(debug=True, host='0.0.0.0', port=5000)
+
+if __name__ == "__main__":
+    while True:
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            logging.error(f"Fatal error: {e}. Restarting in 5 seconds...")
+            time.sleep(5)
+

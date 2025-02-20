@@ -1,0 +1,5 @@
+quart
+ib-insync
+requests
+werkzeug
+pandas
