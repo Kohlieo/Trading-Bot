@@ -1,3 +1,15 @@
+
+# order_management.py
+# -------------------
+# This module handles the placement and management of trade orders. Its responsibilities include:
+#   - Placing BUY and SELL orders with proper price adjustments (using market data and a pre-market buffer)
+#   - Checking for sufficient equity and verifying open positions before executing orders
+#   - Rounding prices to valid tick sizes for order accuracy
+#   - Logging trade details via the trade_logger module
+#   - Monitoring orders until they are filled or cancelled
+#   - Providing a function to close all open positions for a given symbol
+# This module integrates closely with the IBKR client and the symbol monitoring system to ensure reliable order execution.
+
 import asyncio
 import logging
 import math

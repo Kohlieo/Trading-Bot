@@ -1,4 +1,13 @@
+
 # symbol_monitor.py
+# -----------------
+# This module defines the SymbolMonitor class for real-time monitoring and dynamic management of open positions. Its responsibilities include:
+#   - Continuously tracking the current price and updating the highest price reached post-order execution
+#   - Adjusting trailing stop-loss levels based on price movements and setting fixed stop-loss thresholds when triggered
+#   - Implementing multi-step take profit targets for partial position liquidation
+#   - Monitoring for market data errors and automatically handling error events by initiating position closures
+#   - Subscribing to real-time market data and updating technical indicators (e.g., EMAs) for risk management
+# This module enhances risk control by dynamically managing active trades after a BUY order is filled.
 
 import asyncio
 import logging

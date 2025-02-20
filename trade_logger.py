@@ -1,3 +1,12 @@
+
+# trade_logger.py
+# ---------------
+# This module is responsible for logging all executed trades into a CSV file. It records details such as:
+#   - Timestamp of the trade
+#   - Symbol, action (BUY/SELL), quantity, and price
+#   - Order ID and any extra information related to the trade
+# Trades are appended to a shared CSV log file, facilitating audit trails and post-trade analysis.
+
 import csv
 import os
 from datetime import datetime

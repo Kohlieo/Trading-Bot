@@ -1,4 +1,12 @@
 # ibkr_connection.py
+# -------------------
+# This module implements the IBKRClient class to manage connectivity with Interactive Brokers (IBKR). Key functions include:
+#   - Establishing and ensuring a stable asynchronous connection to IBKR (connect, ensure_connection)
+#   - Disconnecting safely from IBKR
+#   - Retrieving account balance and synchronizing positions with IBKR
+#   - Determining appropriate tick sizes for given symbols based on current market prices
+#   - Cancelling active orders when needed
+# The module leverages the ib_insync library and patches the asyncio event loop to seamlessly integrate IBKR API operations.
 
 import asyncio
 import logging

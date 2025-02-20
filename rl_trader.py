@@ -1,3 +1,16 @@
+
+# rl_trader.py
+# ------------
+# This module implements the RLTrader class, which uses a reinforcement learning (RL) strategy to drive trading decisions. Key functionalities include:
+#   - Loading a pre-trained PPO model for trade prediction
+#   - Subscribing to real-time market data for selected trading symbols
+#   - Buffering tick data and computing technical indicators (SMA, RSI, MACD, Bollinger Bands, ATR, etc.) using pandas_ta
+#   - Predicting trading actions (BUY, SELL, HOLD) based on computed features
+#   - Executing orders through the order_management module based on model predictions
+#   - Enforcing trade limits and managing per-symbol trade cycles
+#   - Performing online incremental training using collected daily data via a custom TradingEnv simulation
+# This module is central to the autonomous trading strategy and interacts with both the IBKR API and the simulation environment.
+
 import os
 import gym
 import numpy as np

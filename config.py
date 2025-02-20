@@ -1,4 +1,15 @@
+
 # config.py
+# ---------
+# This module centralizes all configuration settings for the trading bot. It defines constants and parameters used across the system including:
+#   - Logging configuration (LOG_LEVEL)
+#   - IBKR connection settings (IB_HOST, IB_PORT, IB_CLIENT_ID)
+#   - Trading parameters (TAKE_PROFIT_PERCENTAGE, INITIAL_STOP_LOSS_PERCENTAGE, TRAILING_STOP_LOSS_PERCENTAGE, PRE_MARKET_BUFFER, TRADE_EQUITY_PERCENTAGE, etc.)
+#   - File paths (TICK_SIZE_FILE, CSV_PATH, SHARED_DIR for logs)
+#   - Reinforcement Learning settings (RL_MODEL_PATH, RL_SYMBOLS, MAX_SYMBOLS, and RL training parameters)
+#   - Trading environment parameters (TRANSACTION_COST, NOISE_STD, MIN_EPISODE_LENGTH, etc.)
+# These settings can be adjusted via environment variables or by modifying the default values directly.
+
 
 import os
 

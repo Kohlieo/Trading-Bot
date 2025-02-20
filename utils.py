@@ -1,4 +1,10 @@
+
 # utils.py
+# --------
+# This module provides utility functions that are used throughout the trading bot application. Functions include:
+#   - load_tick_sizes and save_tick_sizes: Managing the persistent storage of tick size data in a JSON file
+#   - round_to_tick: Rounding numeric price values to the nearest valid tick size for precision in order execution
+# These helper functions promote code reuse and ensure consistent handling of common operations across the project.
 
 import os
 import json

@@ -1,3 +1,14 @@
+
+# trading_env.py
+# --------------
+# This module implements a custom OpenAI Gym environment (TradingEnv) designed for simulating trading activities. Its features include:
+#   - Loading and preprocessing historical market data from a CSV file
+#   - Computing technical indicators (SMA, RSI, MACD, Bollinger Bands, ATR, etc.) using pandas_ta
+#   - Defining an observation space (14 features) and a discrete action space (0=Hold, 1=Buy, 2=Sell)
+#   - Simulating the trading process with step and reset functions, including reward calculations that factor in transaction costs and trade penalties
+#   - Providing a simulation framework for offline RL model training and strategy backtesting
+# This environment is key for testing and refining trading strategies in a controlled, simulated setting.
+
 import os
 import gym
 from gym import spaces

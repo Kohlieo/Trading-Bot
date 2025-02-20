@@ -1,3 +1,15 @@
+
+# main.py
+# -------
+# This file serves as the entry point for the trading bot application. It performs the following functions:
+#   - Configures logging using settings from config.py
+#   - Initiates and establishes the IBKR connection (via ibkr_client)
+#   - Retrieves account balance and synchronizes positions upon startup
+#   - Sets up signal handlers to gracefully shutdown all asynchronous tasks
+#   - Starts the RL trading process by instantiating and running the RLTrader class
+#   - Launches a web server for webhook/API handling
+# Overall, this file orchestrates the initialization, supervision, and orderly shutdown of the trading bot.
+
 from datetime import datetime
 import asyncio
 import logging
