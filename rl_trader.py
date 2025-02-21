@@ -38,11 +38,11 @@ class RLTrader:
             if os.path.exists(ticker_file):
                 with open(ticker_file, 'r') as f:
                     tickers = json.load(f)
-                if tickers and len(tickers) >= 5:
-                    self.symbols = tickers[:5]
+                if tickers and len(tickers) >= 1:
+                    self.symbols = tickers  # Use all provided tickers, regardless of count
                     logging.info(f"Using tickers from file: {self.symbols}")
                 else:
-                    logging.warning("Not enough tickers found in file; using default RL_SYMBOLS.")
+                    logging.warning("No tickers found in file; using default RL_SYMBOLS.")
                     self.symbols = RL_SYMBOLS
             else:
                 logging.warning(f"{ticker_file} not found; using default RL_SYMBOLS.")
@@ -50,8 +50,6 @@ class RLTrader:
         except Exception as e:
             logging.error("Error loading tickers from file: " + str(e))
             self.symbols = RL_SYMBOLS
-        # Truncate if length > MAX_SYMBOLS
-        self.symbols = self.symbols[:MAX_SYMBOLS]
 
         # Create a temporary environment instance
         env = TradingEnv(load_clean_data())
@@ -228,7 +226,7 @@ class RLTrader:
                 logging.info(f"New trading day (PST): {self.current_trade_date}. Reset trade counters.")
 
             # === Periodically refresh ticker list every 3 minutes ===
-            if (current_utc - self.last_ticker_refresh).total_seconds() >= 180:
+            if (current_utc - self.last_ticker_refresh).total_seconds() >= 60:
                 self.last_ticker_refresh = current_utc
                 ticker_file = "/app/shared/rl_trader_tickers.json"
                 try:
@@ -336,6 +334,8 @@ class RLTrader:
         env = TradingEnv(df)
         logging.info(f"Starting online training for day: {previous_day}")
         self.model.learn(total_timesteps=500)
+        # Persist the updated model to disk
+        self.model.save(RL_MODEL_PATH)
         logging.info(f"Completed online training for day: {previous_day}")
         del self.daily_data[previous_day]
 

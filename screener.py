@@ -11,7 +11,7 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Your custom FinViz screener URL
-CUSTOM_URL = ("https://finviz.com/screener.ashx?v=151&f=news_date_sinceyesterday,sh_avgvol_o50,sh_float_u20,sh_price_u20,sh_relvol_o5,ta_change_u10&ft=4&o=-gap&ar=180&c=0,1,25,30,84,36,60,61,64,67,65")
+CUSTOM_URL = ("https://finviz.com/screener.ashx?v=151&f=news_date_sinceyesterday,sh_curvol_o50,sh_float_u20,sh_price_u20,sh_relvol_o3,ta_change_u3,ta_gap_u,ta_perf_dup&ft=6&o=-gap&ar=180&c=0,1,25,30,84,36,60,61,64,67,65")
 
 # Update OUTPUT_FILE path to point to the shared volume.
 OUTPUT_FILE = "C:/SharedData/rl_trader_tickers.json"
